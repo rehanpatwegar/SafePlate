@@ -1,276 +1,215 @@
 const express = require('express');
 const router = express.Router();
-const db = require('../supabase');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const db = require('../supabase');
+require('dotenv').config();
 
+// Initialize Gemini Client
 const apiKey = process.env.GEMINI_API_KEY;
 let genAI = null;
-if (apiKey) {
+if (apiKey && apiKey !== 'your_gemini_api_key_here') {
   try {
     genAI = new GoogleGenerativeAI(apiKey);
   } catch (err) {
-    console.warn("Notice: Gemini SDK initialized with invalid or placeholder key, will use structured fallback.", err.message);
+    console.warn('⚠️ Could not initialize Gemini SDK:', err.message);
   }
 }
 
-// 1. EXPLAIN RISK ENDPOINT (/api/genai/explain-risk)
+// POST /api/genai/chat - Dynamic Grounded AI Assistant
+router.post('/chat', async (req, res) => {
+  try {
+    const { message, establishmentId } = req.body;
+    const query = (message || '').trim();
+
+    if (!query) {
+      return res.status(400).json({ success: false, message: 'Query message is required' });
+    }
+
+    // 1. Fetch live database context specifically for queried establishment
+    let targetEst = null;
+    let inspections = [];
+    let violations = [];
+
+    if (establishmentId) {
+      targetEst = await db.getEstablishmentById(establishmentId);
+      if (targetEst) {
+        inspections = await db.getInspections(establishmentId);
+        violations = await db.getViolations({ establishment_id: establishmentId });
+      }
+    }
+
+    // Fallback: If no ID was sent, check if establishment name is mentioned in query
+    if (!targetEst) {
+      const allEsts = await db.getEstablishments();
+      targetEst = allEsts.find(e => query.toLowerCase().includes(e.name.toLowerCase()));
+      if (targetEst) {
+        inspections = await db.getInspections(targetEst.id);
+        violations = await db.getViolations({ establishment_id: targetEst.id });
+      }
+    }
+
+    // 2. Build Grounded Context
+    let contextData = '';
+    if (targetEst) {
+      const activeViolations = violations.filter(v => v.corrective_action_status !== 'Resolved' && v.corrective_action_status !== 'Closed');
+      const criticalViolations = activeViolations.filter(v => v.severity === 'Critical');
+
+      contextData = `
+TARGET FACILITY RECORD:
+- Facility Name: ${targetEst.name} (Type: ${targetEst.type})
+- Current Risk Score: ${targetEst.risk_score} / 100
+- Risk Category: ${targetEst.risk_category}
+- Zone: ${targetEst.zone}
+- Last Inspected Date: ${targetEst.last_inspection_date || 'No recorded audit'}
+- Total Audits on Record: ${inspections.length}
+- Total Unresolved Violations: ${activeViolations.length}
+- Critical Unresolved Violations: ${criticalViolations.length}
+
+VIOLATION LOG:
+${activeViolations.length > 0 ? JSON.stringify(activeViolations.map(v => ({
+  category: v.category,
+  severity: v.severity,
+  description: v.description,
+  status: v.corrective_action_status
+})), null, 2) : 'No unresolved violations.'}
+`;
+    } else {
+      const allEsts = await db.getEstablishments();
+      const criticalEsts = allEsts.filter(e => e.risk_category === 'CRITICAL');
+      contextData = `
+MUNICIPAL PUBLIC HEALTH SUMMARY:
+- Total Monitored Establishments: ${allEsts.length}
+- Critical Risk Facilities (${criticalEsts.length}): ${criticalEsts.map(e => `${e.name} (Score: ${e.risk_score})`).join(', ')}
+`;
+    }
+
+    // 3. Attempt live call to Gemini API
+    if (genAI) {
+      try {
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const systemPrompt = `
+You are SafePlate Copilot, an expert AI assistant for municipal food safety officers and establishment managers.
+Analyze the user's question using ONLY the provided verified database context below.
+Be concise, professional, and data-backed. Never invent citations or violation facts.
+
+VERIFIED DATABASE CONTEXT:
+${contextData}
+
+USER QUERY:
+${query}
+`;
+        const result = await model.generateContent(systemPrompt);
+        const aiResponse = result.response.text();
+
+        return res.json({
+          success: true,
+          source: 'gemini-1.5-flash',
+          reply: aiResponse
+        });
+      } catch (geminiError) {
+        console.warn('Gemini API call failed, using dynamic database fallback:', geminiError.message);
+      }
+    }
+
+    // 4. Grounded Dynamic Fallback (Accurate to the queried establishment)
+    let fallbackReply = '';
+    if (targetEst) {
+      const activeViolations = violations.filter(v => v.corrective_action_status !== 'Resolved' && v.corrective_action_status !== 'Closed');
+      const criticalCount = activeViolations.filter(v => v.severity === 'Critical').length;
+
+      fallbackReply = `**${targetEst.name}** is currently designated as **${targetEst.risk_category}** with a compliance risk score of **${targetEst.risk_score}/100**.\n\n` +
+        `- **Location & Zone:** ${targetEst.address} (${targetEst.zone})\n` +
+        `- **Audit Record:** ${inspections.length} inspection(s) logged. Last audit: ${targetEst.last_inspection_date || 'N/A'}.\n` +
+        `- **Active Violations:** ${activeViolations.length} unresolved issue(s) (${criticalCount} Critical).\n\n` +
+        (criticalCount > 0
+          ? `Priority enforcement recommended due to open critical infractions: ${activeViolations.filter(v => v.severity === 'Critical').map(v => v.category).join(', ')}.`
+          : `Facility maintains standard compliance standing with no immediate critical health hazards.`);
+    } else {
+      fallbackReply = `SafePlate Municipal Intelligence is currently monitoring food safety compliance across all municipal zones. For a specific facility analysis, please select an establishment or mention its name.`;
+    }
+
+    return res.json({
+      success: true,
+      source: 'grounded-database-engine',
+      reply: fallbackReply
+    });
+
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// POST /api/genai/explain-risk - Direct Risk Reasoning
 router.post('/explain-risk', async (req, res) => {
   try {
-    const { establishment_id } = req.body;
-    const est = await db.getEstablishmentById(establishment_id || 1);
+    const { establishmentId } = req.body;
+    if (!establishmentId) {
+      return res.status(400).json({ success: false, message: 'establishmentId is required' });
+    }
+
+    const est = await db.getEstablishmentById(establishmentId);
     if (!est) {
       return res.status(404).json({ success: false, message: 'Establishment not found' });
     }
 
-    const violations = await db.getViolations({ establishment_id: est.id });
-    const inspections = await db.getInspections(est.id);
-
-    // If Gemini API is available and configured
-    if (genAI && apiKey && !apiKey.startsWith("YOUR_")) {
-      try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const prompt = `You are SafePlate AI, an authoritative public health auditor.
-Analyze this food establishment:
-Name: ${est.name} (${est.type})
-Risk Score: ${est.risk_score}/100 (${est.risk_category})
-Address: ${est.address}
-Active Violations:
-${violations.map(v => `- [${v.severity}] ${v.category}: ${v.description} (Status: ${v.corrective_action_status})`).join('\n')}
-
-Explain clearly why this establishment is at this risk level, the health code hazards, immediate priorities, and how resolving violations drops the risk score.`;
-        
-        const result = await model.generateContent(prompt);
-        const text = result.response.text();
-        return res.json({
-          success: true,
-          establishment: est.name,
-          risk_score: est.risk_score,
-          risk_category: est.risk_category,
-          source: "gemini-1.5-flash",
-          analysis: text
-        });
-      } catch (geminiError) {
-        console.warn("Gemini API call failed, falling back to structured intelligence engine:", geminiError.message);
-      }
-    }
-
-    // High-quality structured fallback grounded in actual database records
-    const criticals = violations.filter(v => v.severity === 'Critical');
-    const majors = violations.filter(v => v.severity === 'Major');
-    const minors = violations.filter(v => v.severity === 'Minor');
-
-    const analysis = `### Executive Risk Assessment: ${est.name}
-**Status:** **${est.risk_score}/100 (${est.risk_category})** | **Zone:** ${est.zone} | **Audited:** ${est.last_inspection_date}
-
-#### 1. Root Cause Breakdown
-The elevated risk score is heavily driven by **${criticals.length} Critical Violation(s)** and **${majors.length} Major Violation(s)** currently unresolved on record:
-${criticals.map(c => `• **[CRITICAL HAZARD] ${c.category}:** ${c.description}`).join('\n')}
-${majors.map(m => `• **[MAJOR DEFICIENCY] ${m.category}:** ${m.description}`).join('\n')}
-${minors.map(mn => `• **[MINOR DEFICIENCY] ${mn.category}:** ${mn.description}`).join('\n')}
-
-#### 2. Public Health & Pathogenic Hazards
-- **Temperature Abuse:** Walk-in cooler operating at 53.4°F breaches bacterial danger zone boundaries (41°F–135°F), creating active multiplication vectors for *Salmonella enterica* and *Campylobacter jejuni*.
-- **Pest Infiltration:** Active rodent droppings in dry stores create fecal-oral contamination vectors across porous packaging and bulk dry ingredients.
-- **Cross-Contamination Risk:** Uncovered raw meats placed above ready-to-eat dairy and cold sauces create severe drip hazard.
-
-#### 3. Immediate Corrective Action Plan (CAP)
-1. **Quarantine & Recalibrate Cooling:** Condemn all poultry held above 45°F for >2 hours. Dispatch commercial refrigeration technician immediately.
-2. **Professional Pest Eradication:** Engage certified vector control operator, seal exterior conduit penetrations, and clean secondary baseboards.
-3. **Storage Tiering:** Implement strict vertical hierarchy: Ready-to-eat top, whole seafood, whole meats, and ground poultry on lowest shelf.
-
-#### 4. Post-Remediation Risk Recalculation
-Upon submitting photographic proof of walk-in cooler repair and vector exclusion, an inspector re-inspection will verify and resolve these findings. SafePlate's dynamic risk engine will recalculate:
-**Target Score:** Drops from **${est.risk_score} (${est.risk_category})** to **~20 (LOW RISK)**.`;
+    const violations = await db.getViolations({ establishment_id: establishmentId });
+    const active = violations.filter(v => v.corrective_action_status !== 'Resolved' && v.corrective_action_status !== 'Closed');
 
     res.json({
       success: true,
       establishment: est.name,
       risk_score: est.risk_score,
       risk_category: est.risk_category,
-      source: "safeplate-grounded-intelligence",
-      analysis
+      unresolved_violations_count: active.length,
+      explanation: `Calculated from base score (15) plus ${active.length} active violations across critical and major hazard categories.`
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-// 2. DETECT VIOLATION FROM IMAGE ENDPOINT (/api/genai/detect-violation-image)
-// Simulates / connects to computer vision inspection model
+// POST /api/genai/detect-violation-image (AI Vision Demonstration Simulation)
 router.post('/detect-violation-image', async (req, res) => {
   try {
-    const { image_url, scenario } = req.body;
+    const { profile = 'cooler' } = req.body;
 
-    // Detection profiles for pre-fill simulation
-    const detectedProfiles = {
+    const PRESETS = {
       cooler: {
         category: "Temperature",
         severity: "Critical",
-        description: "Refrigeration digital readout indicates 53.4°F ambient holding temp; condensation dripping onto raw poultry crates.",
-        confidence: 0.96,
-        detected_objects: ["Digital Thermometer (53.4°F)", "Raw Chicken Trays", "Condensation Accumulation"],
-        suggested_action: "Immediate rapid-chill transfer and service inspection of evaporator fan coil."
+        description: "Refrigeration display unit registering 53.4°F ambient air temp; unsafe storage threshold exceeded.",
+        recommendedAction: "Immediately service evaporator coil and relocate perishable items to walk-in cooler."
       },
       pantry: {
         category: "Pest",
-        severity: "Critical",
-        description: "Multiple rodent fecal droppings identified along lower wooden framing near bulk grain sacks.",
-        confidence: 0.94,
-        detected_objects: ["Rodent Pellets", "Torn Paper Sacking", "Unsealed Wall Gap"],
-        suggested_action: "Dispose of compromised dry goods, deploy sealed metal bins, and call commercial pest control."
+        severity: "Major",
+        description: "Dry storage packaging displays evidence of pest intrusion and improper ground clearance.",
+        recommendedAction: "Sanitize shelving, install perimeter pest traps, and elevate containers 6 inches above floor."
       },
       prep: {
         category: "Cross-Contamination",
-        severity: "Major",
-        description: "Raw red meat resting on plastic cutting board in direct proximity to exposed garnish salad greens.",
-        confidence: 0.91,
-        detected_objects: ["Raw Beef Cut", "Chopped Parsley", "Shared Prep Surface"],
-        suggested_action: "Sanitize prep surface with 100ppm chlorine solution and enforce color-coded cutting boards."
+        severity: "Critical",
+        description: "Raw poultry preparation observed on board designated for ready-to-eat vegetables.",
+        recommendedAction: "Sanitize station immediately and conduct staff re-training on color-coded board protocols."
       },
       sink: {
         category: "Sanitation",
-        severity: "Minor",
-        description: "Designated handwashing station obstructed with dirty cookware; hand drying dispenser empty.",
-        confidence: 0.89,
-        detected_objects: ["Blocked Handsink Basin", "Empty Towel Dispenser", "Aluminum Sheet Pans"],
-        suggested_action: "Clear sink basin immediately, stock with warm running water (100°F+), and install towel refills."
+        severity: "Major",
+        description: "Handwashing station lacks required paper towel dispenser and soap cartridge.",
+        recommendedAction: "Restock handwashing supplies immediately prior to next food preparation shift."
       }
     };
 
-    // Pick profile based on scenario or image hint
-    const key = scenario && detectedProfiles[scenario] ? scenario : "cooler";
-    const detection = detectedProfiles[key];
+    const detected = PRESETS[profile] || PRESETS.cooler;
 
     res.json({
       success: true,
-      detection: {
-        ...detection,
-        image_url: image_url || "https://images.unsplash.com/photo-1584992236310-6edddc08acff?w=600",
-        timestamp: new Date().toISOString(),
-        model: "SafePlate-CV-FoodSafety-v2"
+      data: {
+        ...detected,
+        confidence: 0.96,
+        model: "SafePlate-CV-FoodSafety-v2 (Demo Pipeline)"
       }
     });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 3. GROUNDED INTERACTIVE CHAT ASSISTANT (/api/genai/chat)
-router.post('/chat', async (req, res) => {
-  try {
-    const { message, establishment_id } = req.body;
-    if (!message) {
-      return res.status(400).json({ success: false, message: 'Message is required' });
-    }
-
-    const establishments = await db.getEstablishments();
-    const centralSpice = establishments.find(e => e.id === 1);
-    const violations = await db.getViolations();
-    const inspections = await db.getInspections();
-
-    const lower = message.toLowerCase();
-
-    // Grounded Q&A heuristics
-    if (lower.includes('central spice') || lower.includes('why') && lower.includes('high risk')) {
-      return res.json({
-        success: true,
-        response: `**Central Spice Restaurant** is currently designated as **CRITICAL RISK** with a score of **84/100** due to 3 active high-impact violations flagged in their latest unannounced inspection on August 25, 2026:
-
-1. **Critical Temperature Abuse:** Walk-in cooler running at **53.4°F** (well above the safe threshold of ≤ 41°F). Marinated raw chicken held at 52°F for over 4 hours.
-2. **Critical Pest Infestation:** Rodent droppings detected along baseboards in the dry storage pantry.
-3. **Major Cross-Contamination:** Raw beef stored on top racks directly over open sauces and chopped garnish.
-
-**How to reduce the score:**
-Once the establishment owner submits proof of refrigeration repair, pest eradication, and storage rearrangement via the Corrective Actions portal, an inspector will conduct a re-inspection. Approving these corrective actions triggers an automated recalculation dropping the risk score from **84 (CRITICAL)** down to **20 (LOW RISK)**.`
-      });
-    }
-
-    if (lower.includes('summarize') || lower.includes('history') || lower.includes('inspection history')) {
-      const targetEst = establishment_id ? establishments.find(e => e.id === parseInt(establishment_id, 10)) : centralSpice;
-      const targetInspections = inspections.filter(i => i.establishment_id === (targetEst ? targetEst.id : 1));
-      
-      return res.json({
-        success: true,
-        response: `### Inspection History Summary for ${targetEst.name}:
-- **Total Inspections on Record:** ${targetInspections.length}
-- **Latest Inspection (2026-08-25):** Conducted by Officer Marcus Brody. Score: **58/100 (Submitted)**. Found walk-in refrigeration breakdown and rodent signs.
-- **Prior Inspection (2026-05-12):** Conducted by Officer Sarah Alvarez. Score: **82/100 (Resolved)**. Handwashing sink minor issue noted.
-- **Baseline Audit (2026-01-18):** Score: **74/100 (Resolved)**. Warnings issued for food storage hierarchy.
-
-**Compliance Trajectory:** The facility was maintaining stable compliance until refrigeration failure and vector infiltration triggered their current Critical risk designation.`
-      });
-    }
-
-    if (lower.includes('overdue') || lower.includes('pending')) {
-      const overdue = establishments.filter(e => e.risk_score >= 60);
-      return res.json({
-        success: true,
-        response: `There are currently **${overdue.length} establishments requiring immediate supervisory attention**:
-${overdue.map(e => `• **${e.name}** — Score: ${e.risk_score}/100 (${e.risk_category}), Zone: ${e.zone}, Last Inspected: ${e.last_inspection_date}`).join('\n')}
-
-Inspectors should prioritize **Central Spice Restaurant** and **Northside Meat Processing & Deli** for priority re-inspections.`
-      });
-    }
-
-    if (lower.includes('recalculate') || lower.includes('formula')) {
-      return res.json({
-        success: true,
-        response: `SafePlate's dynamic risk scoring formula is:
-$$\\text{Risk Score} = \\text{Base (15)} + (\\text{Critical} \\times 35) + (\\text{Major} \\times 15) + (\\text{Minor} \\times 5)$$
-
-**Risk Tier Mapping:**
-- **0 – 34:** LOW RISK (Routine annual inspection)
-- **35 – 59:** MEDIUM RISK (Bi-annual audit required)
-- **60 – 79:** HIGH RISK (Quarterly audits + mandatory CAP)
-- **80 – 100:** CRITICAL (Immediate closure warning or 72-hour re-inspection)
-
-When all open violations are verified and resolved, the score drops to **15–20 (LOW RISK)**.`
-      });
-    }
-
-    // Default informative response
-    res.json({
-      success: true,
-      response: `I am SafePlate Intelligence. I can assist you with:
-- **Risk Inquiries:** Ask *"Why is Central Spice high risk?"* or *"What is the risk formula?"*
-- **Inspection Histories:** Ask *"Summarize Central Spice's inspection history"*
-- **High-Risk Overviews:** Ask *"Show overdue inspections and high risk restaurants"*
-- **Corrective Actions Guidance:** Ask *"How do I resolve a critical temperature violation?"*
-
-Feel free to ask any question regarding active food facilities, statutory health codes, or inspection schedules.`
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 4. PRE-INSPECTION BRIEFING ENDPOINT
-router.post('/briefing/:id', async (req, res) => {
-  try {
-    const est = await db.getEstablishmentById(req.params.id);
-    if (!est) return res.status(404).json({ success: false, message: 'Establishment not found' });
-
-    const violations = await db.getViolations({ establishment_id: est.id });
-    const briefing = {
-      establishment: est.name,
-      address: est.address,
-      zone: est.zone,
-      risk_category: est.risk_category,
-      risk_score: est.risk_score,
-      critical_checkpoints: [
-        "Inspect Walk-in Cooler #1 internal core temperatures with calibrated thermocouple (Target: <= 41°F).",
-        "Perform UV blacklight scan and baseboard inspection in dry storage pantry for rodent ingress.",
-        "Verify raw meat storage shelves are placed strictly beneath ready-to-eat foods.",
-        "Check dedicated handwashing sinks for hot water (>= 100°F), soap, and paper towel availability."
-      ],
-      interviews_required: [
-        "Confirm Person in Charge (PIC) holds a valid Food Protection Manager Certification.",
-        "Review refrigeration temp log records for the past 14 days.",
-        "Inspect pest control operator service receipts and chemical application logs."
-      ]
-    };
-
-    res.json({ success: true, data: briefing });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
