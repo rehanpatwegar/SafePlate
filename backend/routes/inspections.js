@@ -58,9 +58,14 @@ router.get('/:id', async (req, res) => {
 // POST schedule / create a new inspection
 router.post('/', async (req, res) => {
   try {
-    const { establishment_id, inspector_name, inspection_date, status, notes } = req.body;
+    const { establishment_id, inspector_name, inspection_date, status, score, notes } = req.body;
     if (!establishment_id) {
       return res.status(400).json({ success: false, message: 'establishment_id is required' });
+    }
+
+    const evaluationScore = Number(score);
+    if (score !== undefined && (!Number.isInteger(evaluationScore) || evaluationScore < 0 || evaluationScore > 100)) {
+      return res.status(400).json({ success: false, message: 'score must be a whole number between 0 and 100' });
     }
 
     const newInspection = await db.createInspection({
@@ -68,7 +73,7 @@ router.post('/', async (req, res) => {
       inspector_name: inspector_name || "Officer Marcus Brody",
       inspection_date: inspection_date || new Date().toISOString().split('T')[0],
       status: status || "Scheduled",
-      score: 85,
+      score: score === undefined || score === '' ? 85 : evaluationScore,
       notes: notes || "Standard unannounced compliance audit"
     });
 

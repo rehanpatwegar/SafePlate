@@ -112,6 +112,10 @@ export default function App() {
               openCreateModalByDefault={tabParams.openCreateModal}
               defaultEstablishmentId={tabParams.defaultEstablishmentId}
               defaultInspectionId={tabParams.defaultInspectionId}
+              onOpenInspectionModal={(estId) => navigateToTab('inspections', {
+                openCreateModal: true,
+                defaultEstablishmentId: estId
+              })}
             />
           )}
 

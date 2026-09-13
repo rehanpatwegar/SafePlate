@@ -131,3 +131,14 @@ python risk_model.py
 10. **Re-Inspection Sign-Off**: Switch to Inspector role and click "Verify & Resolve" on submitted corrective proof.
 11. **Risk Recalculated**: Watch the celebratory alert as the dynamic risk recalculation runs and drops Central Spice's score from **84 (CRITICAL)** to **20 (LOW RISK)**!
 12. **GenAI Assistant**: Ask questions like *"Why is Central Spice high risk?"* or *"Summarize inspection history"* to receive database-grounded insights.
+
+---
+
+## Hotel Demo Flow
+
+For a concise live presentation, use this four-step flow:
+
+1. Open **Establishments** and select **Add Hotel / Establishment**.
+2. Enter the hotel details and choose **Hotel Kitchen** or **Hotel Restaurant** as the type. Save the record.
+3. In the new hotel profile, select **Assign Inspector & Evaluate**. Choose the inspector, evaluation score, and status, then save.
+4. The assignment and score appear immediately in **Inspections** and in the hotel's **Chronological Inspection History**. The hotel profile also shows its live risk score and category.

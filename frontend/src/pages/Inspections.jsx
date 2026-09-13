@@ -25,6 +25,7 @@ export default function Inspections({ openCreateModalByDefault, defaultEstablish
     inspector_name: 'Officer Marcus Brody',
     inspection_date: new Date().toISOString().split('T')[0],
     status: 'In Progress',
+    score: 85,
     notes: 'Comprehensive food code hygiene and cold holding compliance audit'
   });
   const [submitting, setSubmitting] = useState(false);
@@ -56,7 +57,7 @@ export default function Inspections({ openCreateModalByDefault, defaultEstablish
       setSubmitting(true);
       const res = await api.createInspection(formData);
       if (res.success) {
-        setStatusMessage('Inspection successfully scheduled and initiated!');
+        setStatusMessage(`Inspector assigned and evaluation recorded: ${res.data.inspector_name} • ${res.data.score}/100.`);
         setShowModal(false);
         await fetchInspectionsAndEsts();
       }
@@ -101,7 +102,7 @@ export default function Inspections({ openCreateModalByDefault, defaultEstablish
           className="flex items-center gap-2 px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold rounded-xl text-xs shadow-lg shadow-cyan-500/20 transition-all"
         >
           <PlusCircle className="w-4 h-4" />
-          <span>Schedule New Inspection</span>
+          <span>Assign Inspector & Evaluate</span>
         </button>
       </div>
 
@@ -256,7 +257,7 @@ export default function Inspections({ openCreateModalByDefault, defaultEstablish
 
             <div className="flex items-center gap-2 mb-4">
               <ClipboardList className="w-5 h-5 text-cyan-400" />
-              <h3 className="text-lg font-bold text-white">Schedule New Inspection</h3>
+              <h3 className="text-lg font-bold text-white">Assign Inspector & Evaluate</h3>
             </div>
 
             <form onSubmit={handleCreateInspection} className="space-y-4 text-xs">
@@ -298,6 +299,20 @@ export default function Inspections({ openCreateModalByDefault, defaultEstablish
               </div>
 
               <div>
+                <label className="block text-slate-300 font-semibold mb-1">Evaluation Score (0–100)</label>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  required
+                  value={formData.score}
+                  onChange={(e) => setFormData({ ...formData, score: e.target.value })}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
+                />
+                <p className="mt-1 text-[10px] text-slate-500">This compliance evaluation is shown in the inspection list and hotel profile.</p>
+              </div>
+
+              <div>
                 <label className="block text-slate-300 font-semibold mb-1">Initial Workflow Status</label>
                 <select
                   value={formData.status}
@@ -334,7 +349,7 @@ export default function Inspections({ openCreateModalByDefault, defaultEstablish
                   disabled={submitting}
                   className="px-4 py-2 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold rounded-xl shadow-lg shadow-cyan-500/20"
                 >
-                  {submitting ? 'Creating...' : 'Initiate Inspection'}
+                  {submitting ? 'Saving...' : 'Assign & Save Evaluation'}
                 </button>
               </div>
             </form>

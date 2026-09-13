@@ -15,7 +15,7 @@ import {
 } from 'lucide-react';
 import api from '../services/api';
 
-export default function Violations({ openCreateModalByDefault, defaultEstablishmentId, defaultInspectionId }) {
+export default function Violations({ openCreateModalByDefault, defaultEstablishmentId, defaultInspectionId, onOpenInspectionModal }) {
   const [violations, setViolations] = useState([]);
   const [establishments, setEstablishments] = useState([]);
   const [inspections, setInspections] = useState([]);
@@ -24,8 +24,8 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
   
   // Form State
   const [formData, setFormData] = useState({
-    establishment_id: defaultEstablishmentId || '1',
-    inspection_id: defaultInspectionId || '1',
+    establishment_id: defaultEstablishmentId ? String(defaultEstablishmentId) : '',
+    inspection_id: defaultInspectionId ? String(defaultInspectionId) : '',
     category: 'Temperature',
     severity: 'Critical',
     description: '',
@@ -43,14 +43,14 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
   const fetchAllData = async () => {
     try {
       setLoading(true);
-      const [violRes, estRes, inspRes] = await Promise.all([
+      const [violResult, estResult, inspResult] = await Promise.allSettled([
         api.getViolations(),
         api.getEstablishments(),
         api.getInspections()
       ]);
-      if (violRes.success) setViolations(violRes.data);
-      if (estRes.success) setEstablishments(estRes.data);
-      if (inspRes.success) setInspections(inspRes.data);
+      if (violResult.status === 'fulfilled' && violResult.value.success) setViolations(violResult.value.data);
+      if (estResult.status === 'fulfilled' && estResult.value.success) setEstablishments(estResult.value.data);
+      if (inspResult.status === 'fulfilled' && inspResult.value.success) setInspections(inspResult.value.data);
     } catch (err) {
       console.error('Failed to load violations:', err);
     } finally {
@@ -61,6 +61,42 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
   useEffect(() => {
     fetchAllData();
   }, []);
+
+  // Keep the two dropdowns connected: an inspection always belongs to one establishment.
+  useEffect(() => {
+    if (!establishments.length) return;
+
+    setFormData((current) => {
+      const requestedEstablishmentId = defaultEstablishmentId ? String(defaultEstablishmentId) : current.establishment_id;
+      const establishmentId = establishments.some((est) => String(est.id) === requestedEstablishmentId)
+        ? requestedEstablishmentId
+        : String(establishments[0].id);
+      const matchingInspections = inspections.filter((inspection) => String(inspection.establishment_id) === establishmentId);
+      const requestedInspectionId = defaultInspectionId ? String(defaultInspectionId) : current.inspection_id;
+      const inspectionId = matchingInspections.some((inspection) => String(inspection.id) === requestedInspectionId)
+        ? requestedInspectionId
+        : (matchingInspections[0] ? String(matchingInspections[0].id) : '');
+
+      if (current.establishment_id === establishmentId && current.inspection_id === inspectionId) return current;
+      return { ...current, establishment_id: establishmentId, inspection_id: inspectionId };
+    });
+  }, [establishments, inspections, defaultEstablishmentId, defaultInspectionId]);
+
+  const linkedInspections = inspections.filter(
+    (inspection) => String(inspection.establishment_id) === String(formData.establishment_id)
+  );
+
+  const handleEstablishmentChange = (event) => {
+    const establishmentId = event.target.value;
+    const firstInspection = inspections.find(
+      (inspection) => String(inspection.establishment_id) === String(establishmentId)
+    );
+    setFormData((current) => ({
+      ...current,
+      establishment_id: establishmentId,
+      inspection_id: firstInspection ? String(firstInspection.id) : ''
+    }));
+  };
 
   // AI COMPUTER VISION DETECTION PRE-FILL HANDLER
   const handleAIPrefill = async (scenario = 'cooler') => {
@@ -89,14 +125,15 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
         scenario: selected.scenario
       });
 
-      if (res.success && res.detection) {
-        const d = res.detection;
+      const detection = res.detection || res.data;
+      if (res.success && detection) {
+        const d = detection;
         setFormData(prev => ({
           ...prev,
           category: d.category,
           severity: d.severity,
           description: d.description,
-          evidence_image_url: d.image_url
+          evidence_image_url: d.image_url || prev.evidence_image_url
         }));
         setAiDetectionResult(d);
       }
@@ -109,6 +146,10 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
 
   const handleCreateViolation = async (e) => {
     e.preventDefault();
+    if (!formData.establishment_id || !formData.inspection_id) {
+      alert('Create an inspection for this establishment before recording a violation.');
+      return;
+    }
     try {
       setSubmitting(true);
       const res = await api.createViolation(formData);
@@ -389,9 +430,10 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
                   <label className="block text-slate-300 font-semibold mb-1">Establishment</label>
                   <select
                     value={formData.establishment_id}
-                    onChange={(e) => setFormData({ ...formData, establishment_id: e.target.value })}
+                    onChange={handleEstablishmentChange}
                     className="w-full bg-slate-800 border border-slate-700 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
                   >
+                    {!establishments.length && <option value="">No establishments available</option>}
                     {establishments.map(e => (
                       <option key={e.id} value={e.id}>{e.name}</option>
                     ))}
@@ -403,16 +445,31 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
                   <select
                     value={formData.inspection_id}
                     onChange={(e) => setFormData({ ...formData, inspection_id: e.target.value })}
+                    disabled={!linkedInspections.length}
                     className="w-full bg-slate-800 border border-slate-700 rounded-xl p-2.5 text-white focus:outline-none focus:border-cyan-500"
                   >
-                    {inspections.map(i => (
+                    {!linkedInspections.length && <option value="">Create an inspection first</option>}
+                    {linkedInspections.map(i => (
                       <option key={i.id} value={i.id}>
-                        #INS-{i.id} ({i.inspection_date})
+                        #INS-{i.id} — {i.inspector_name} ({i.inspection_date})
                       </option>
                     ))}
                   </select>
                 </div>
               </div>
+
+              {formData.establishment_id && !linkedInspections.length && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                  <span>No inspection has been assigned to this establishment yet. Assign one before recording a violation.</span>
+                  <button
+                    type="button"
+                    onClick={() => onOpenInspectionModal?.(formData.establishment_id)}
+                    className="shrink-0 rounded-lg bg-amber-400 px-3 py-1.5 font-bold text-slate-950 hover:bg-amber-300"
+                  >
+                    Assign Inspector
+                  </button>
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-4">
                 <div>
@@ -485,7 +542,7 @@ export default function Violations({ openCreateModalByDefault, defaultEstablishm
                 </button>
                 <button
                   type="submit"
-                  disabled={submitting}
+                  disabled={submitting || !formData.establishment_id || !formData.inspection_id}
                   className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl shadow-lg shadow-red-900/30"
                 >
                   {submitting ? 'Recording...' : 'Record Violation'}

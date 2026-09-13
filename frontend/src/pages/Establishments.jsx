@@ -36,6 +36,19 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
   const [recalculateMessage, setRecalculateMessage] = useState(null);
   const [aiAnalysis, setAiAnalysis] = useState(null);
   const [aiLoading, setAiLoading] = useState(false);
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [savingEstablishment, setSavingEstablishment] = useState(false);
+  const [createError, setCreateError] = useState('');
+  const [newEstablishment, setNewEstablishment] = useState({
+    name: '',
+    type: 'Restaurant',
+    address: '',
+    zone: 'Zone A',
+    phone: '',
+    email: '',
+    owner_name: '',
+    operating_license: ''
+  });
 
   const fetchEstablishments = async () => {
     try {
@@ -78,8 +91,8 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
       setProfileLoading(true);
       setAiAnalysis(null);
       setRecalculateMessage(null);
-      const res = await axios.get(`http://localhost:5000/api/establishments/${id}`);
-      const profile = res.data?.data || res.data;
+      const res = await api.getEstablishmentById(id);
+      const profile = res?.data || res;
       if (profile) {
         setProfileData(profile);
         setSelectedEstablishment(profile);
@@ -131,6 +144,47 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
     }
   };
 
+  const updateNewEstablishment = (event) => {
+    const { name, value } = event.target;
+    setNewEstablishment((current) => ({ ...current, [name]: value }));
+  };
+
+  const handleCreateEstablishment = async (event) => {
+    event.preventDefault();
+    setCreateError('');
+    setSavingEstablishment(true);
+
+    try {
+      const result = await api.createEstablishment({
+        ...newEstablishment,
+        risk_score: 15,
+        risk_category: 'LOW RISK'
+      });
+
+      if (!result.success || !result.data) {
+        throw new Error(result.message || 'Could not save the establishment.');
+      }
+
+      setShowCreateForm(false);
+      setNewEstablishment({
+        name: '',
+        type: 'Restaurant',
+        address: '',
+        zone: 'Zone A',
+        phone: '',
+        email: '',
+        owner_name: '',
+        operating_license: ''
+      });
+      await fetchEstablishments();
+      await loadProfile(result.data.id);
+    } catch (error) {
+      setCreateError(error.response?.data?.message || error.message || 'Could not save the establishment.');
+    } finally {
+      setSavingEstablishment(false);
+    }
+  };
+
   return (
     <div className="space-y-6 max-w-7xl mx-auto">
       {/* Page Header */}
@@ -149,15 +203,83 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
           </p>
         </div>
 
-        {/* Quick select Central Spice Case Study */}
-        <button
-          onClick={() => loadProfile(1)}
-          className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition-all shadow-sm"
-        >
-          <AlertTriangle className="w-4 h-4 animate-pulse" />
-          <span>Case Study: Central Spice (84/100)</span>
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={() => {
+              setCreateError('');
+              setShowCreateForm(true);
+            }}
+            className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold transition-all shadow-sm"
+          >
+            <PlusCircle className="w-4 h-4" />
+            <span>Add Hotel / Establishment</span>
+          </button>
+          <button
+            onClick={() => loadProfile(1)}
+            className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-red-500/10 hover:bg-red-500/20 border border-red-500/30 text-red-400 text-xs font-semibold transition-all shadow-sm"
+          >
+            <AlertTriangle className="w-4 h-4 animate-pulse" />
+            <span>Case Study: Central Spice (84/100)</span>
+          </button>
+        </div>
       </div>
+
+      {showCreateForm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm overflow-y-auto">
+          <form
+            onSubmit={handleCreateEstablishment}
+            className="w-full max-w-2xl rounded-2xl border border-slate-700 bg-slate-900 p-6 shadow-2xl"
+          >
+            <div className="mb-5 flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-bold text-white">Add Hotel / Food Establishment</h2>
+                <p className="mt-1 text-xs text-slate-400">Create the hotel record here, then assign an inspector and record its evaluation from the profile.</p>
+              </div>
+              <button type="button" onClick={() => setShowCreateForm(false)} className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white">
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <label className="sm:col-span-2 text-xs font-medium text-slate-300">Facility name
+                <input required name="name" value={newEstablishment.name} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500" placeholder="e.g. Riverside Cafe" />
+              </label>
+              <label className="text-xs font-medium text-slate-300">Type
+                <select name="type" value={newEstablishment.type} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500">
+                  <option>Restaurant</option><option>Hotel Kitchen</option><option>Hotel Restaurant</option><option>Cafeteria</option><option>Bakery</option><option>Food Truck</option><option>Hospital Kitchen</option><option>Deli</option><option>Supermarket</option>
+                </select>
+              </label>
+              <label className="text-xs font-medium text-slate-300">Zone
+                <select name="zone" value={newEstablishment.zone} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500">
+                  <option>Zone A</option><option>Zone B</option><option>Zone C</option>
+                </select>
+              </label>
+              <label className="sm:col-span-2 text-xs font-medium text-slate-300">Address
+                <input required name="address" value={newEstablishment.address} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500" placeholder="Street address" />
+              </label>
+              <label className="text-xs font-medium text-slate-300">Owner name
+                <input name="owner_name" value={newEstablishment.owner_name} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500" placeholder="Owner or manager" />
+              </label>
+              <label className="text-xs font-medium text-slate-300">Licence ID
+                <input name="operating_license" value={newEstablishment.operating_license} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500" placeholder="LIC-2026-00001" />
+              </label>
+              <label className="text-xs font-medium text-slate-300">Phone
+                <input name="phone" value={newEstablishment.phone} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500" placeholder="Phone number" />
+              </label>
+              <label className="text-xs font-medium text-slate-300">Email
+                <input type="email" name="email" value={newEstablishment.email} onChange={updateNewEstablishment} className="mt-1.5 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white outline-none focus:border-cyan-500" placeholder="owner@example.com" />
+              </label>
+            </div>
+
+            {createError && <p className="mt-4 rounded-xl border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-300">{createError}</p>}
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button type="button" onClick={() => setShowCreateForm(false)} className="rounded-xl border border-slate-600 px-4 py-2 text-xs font-semibold text-slate-300 hover:bg-slate-800">Cancel</button>
+              <button disabled={savingEstablishment} type="submit" className="rounded-xl bg-cyan-500 px-4 py-2 text-xs font-bold text-slate-950 hover:bg-cyan-400 disabled:opacity-50">{savingEstablishment ? 'Saving...' : 'Save Establishment'}</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Filter Controls Bar */}
       <div className="bg-slate-850 bg-slate-800/60 border border-slate-700/60 rounded-2xl p-4 flex flex-col md:flex-row items-center justify-between gap-3">
@@ -379,7 +501,7 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
                   className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-200 rounded-xl text-xs font-semibold transition-colors"
                 >
                   <PlusCircle className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Schedule Inspection</span>
+                  <span>Assign Inspector & Evaluate</span>
                 </button>
 
                 <button

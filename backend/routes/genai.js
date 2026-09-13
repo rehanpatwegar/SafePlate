@@ -1,217 +1,377 @@
 const express = require('express');
 const router = express.Router();
-const { GoogleGenerativeAI } = require('@google/generative-ai');
 const db = require('../supabase');
+
 require('dotenv').config();
 
-// Initialize Gemini Client
-const apiKey = process.env.GEMINI_API_KEY;
-let genAI = null;
-if (apiKey && apiKey !== 'your_gemini_api_key_here') {
-  try {
-    genAI = new GoogleGenerativeAI(apiKey);
-  } catch (err) {
-    console.warn('⚠️ Could not initialize Gemini SDK:', err.message);
-  }
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
+
+function isGlobalQuestion(query) {
+  return /\b(overdue|all facilities|all restaurants|high[- ]risk restaurants|high[- ]risk facilities|citywide|municipal)\b/i.test(query);
 }
 
-// POST /api/genai/chat - Dynamic Grounded AI Assistant
+function createFallbackReply(targetEst, inspections, violations) {
+  if (!targetEst) {
+    return (
+      'SafePlate is monitoring food-safety compliance across all municipal zones. ' +
+      'Please mention a facility name, for example: “Why is Central Spice Restaurant high risk?”'
+    );
+  }
+
+  const activeViolations = violations.filter(
+    (violation) =>
+      violation.corrective_action_status !== 'Resolved' &&
+      violation.corrective_action_status !== 'Closed'
+  );
+
+  const criticalViolations = activeViolations.filter(
+    (violation) => violation.severity === 'Critical'
+  );
+
+  return (
+    `**${targetEst.name}** is currently classified as **${targetEst.risk_category}** ` +
+    `with a risk score of **${targetEst.risk_score}/100**.\n\n` +
+    `- **Location:** ${targetEst.address}, ${targetEst.zone}\n` +
+    `- **Last inspection:** ${targetEst.last_inspection_date || 'No recorded inspection'}\n` +
+    `- **Inspection records:** ${inspections.length}\n` +
+    `- **Unresolved violations:** ${activeViolations.length}\n` +
+    `- **Critical unresolved violations:** ${criticalViolations.length}\n\n` +
+    (
+      criticalViolations.length > 0
+        ? `Priority action is recommended for: ${criticalViolations
+            .map((violation) => violation.category)
+            .join(', ')}.`
+        : 'There are no open critical violations in the current record.'
+    )
+  );
+}
+
+function createMunicipalFallback(establishments) {
+  const highRisk = establishments.filter(
+    (establishment) =>
+      establishment.risk_category === 'CRITICAL' ||
+      establishment.risk_category === 'HIGH RISK'
+  );
+
+  return (
+    `SafePlate is monitoring **${establishments.length}** facilities.\n\n` +
+    `**High-risk facilities:**\n` +
+    (
+      highRisk.length
+        ? highRisk
+            .map(
+              (establishment) =>
+                `- ${establishment.name}: ${establishment.risk_score}/100 (${establishment.risk_category}), last inspected ${establishment.last_inspection_date || 'not recorded'}`
+            )
+            .join('\n')
+        : '- No high-risk facilities are currently recorded.'
+    )
+  );
+}
+
+// POST /api/genai/chat
 router.post('/chat', async (req, res) => {
   try {
     const { message, establishmentId } = req.body;
-    const query = (message || '').trim();
+    const query = String(message || '').trim();
 
     if (!query) {
-      return res.status(400).json({ success: false, message: 'Query message is required' });
+      return res.status(400).json({
+        success: false,
+        message: 'Please enter a question.'
+      });
     }
 
-    // 1. Fetch live database context specifically for queried establishment
+    const globalQuestion = isGlobalQuestion(query);
+
     let targetEst = null;
     let inspections = [];
     let violations = [];
 
-    if (establishmentId) {
+    const allEstablishments = await db.getEstablishments();
+
+    // Do not force a specific restaurant for city-wide questions.
+    if (establishmentId && !globalQuestion) {
       targetEst = await db.getEstablishmentById(establishmentId);
-      if (targetEst) {
-        inspections = await db.getInspections(establishmentId);
-        violations = await db.getViolations({ establishment_id: establishmentId });
-      }
     }
 
-    // Fallback: If no ID was sent, check if establishment name is mentioned in query
+    // Match both full names and shorter names, such as "Central Spice".
     if (!targetEst) {
-      const allEsts = await db.getEstablishments();
-      targetEst = allEsts.find(e => query.toLowerCase().includes(e.name.toLowerCase()));
-      if (targetEst) {
-        inspections = await db.getInspections(targetEst.id);
-        violations = await db.getViolations({ establishment_id: targetEst.id });
-      }
+      const normalizedQuery = query.toLowerCase();
+
+      targetEst = allEstablishments.find((establishment) => {
+        const facilityName = establishment.name.toLowerCase();
+
+        const meaningfulWords = facilityName
+          .split(/\s+/)
+          .filter((word) => word.length > 3);
+
+        return (
+          normalizedQuery.includes(facilityName) ||
+          meaningfulWords.every((word) => normalizedQuery.includes(word))
+        );
+      });
     }
 
-    // 2. Build Grounded Context
-    let contextData = '';
     if (targetEst) {
-      const activeViolations = violations.filter(v => v.corrective_action_status !== 'Resolved' && v.corrective_action_status !== 'Closed');
-      const criticalViolations = activeViolations.filter(v => v.severity === 'Critical');
+      inspections = await db.getInspections(targetEst.id);
+      violations = await db.getViolations({
+        establishment_id: targetEst.id
+      });
+    }
 
-      contextData = `
-TARGET FACILITY RECORD:
-- Facility Name: ${targetEst.name} (Type: ${targetEst.type})
-- Current Risk Score: ${targetEst.risk_score} / 100
-- Risk Category: ${targetEst.risk_category}
-- Zone: ${targetEst.zone}
-- Last Inspected Date: ${targetEst.last_inspection_date || 'No recorded audit'}
-- Total Audits on Record: ${inspections.length}
-- Total Unresolved Violations: ${activeViolations.length}
-- Critical Unresolved Violations: ${criticalViolations.length}
+    let groundedContext = '';
 
-VIOLATION LOG:
-${activeViolations.length > 0 ? JSON.stringify(activeViolations.map(v => ({
-  category: v.category,
-  severity: v.severity,
-  description: v.description,
-  status: v.corrective_action_status
-})), null, 2) : 'No unresolved violations.'}
+    if (globalQuestion || !targetEst) {
+      groundedContext = `
+MUNICIPAL FOOD-SAFETY DATABASE
+
+Total facilities: ${allEstablishments.length}
+
+FACILITY DIRECTORY:
+${JSON.stringify(
+  allEstablishments.map((establishment) => ({
+    id: establishment.id,
+    name: establishment.name,
+    type: establishment.type,
+    address: establishment.address,
+    zone: establishment.zone,
+    risk_score: establishment.risk_score,
+    risk_category: establishment.risk_category,
+    last_inspection_date: establishment.last_inspection_date
+  })),
+  null,
+  2
+)}
 `;
     } else {
-      const allEsts = await db.getEstablishments();
-      const criticalEsts = allEsts.filter(e => e.risk_category === 'CRITICAL');
-      contextData = `
-MUNICIPAL PUBLIC HEALTH SUMMARY:
-- Total Monitored Establishments: ${allEsts.length}
-- Critical Risk Facilities (${criticalEsts.length}): ${criticalEsts.map(e => `${e.name} (Score: ${e.risk_score})`).join(', ')}
+      const activeViolations = violations.filter(
+        (violation) =>
+          violation.corrective_action_status !== 'Resolved' &&
+          violation.corrective_action_status !== 'Closed'
+      );
+
+      groundedContext = `
+FACILITY RECORD
+
+Name: ${targetEst.name}
+Type: ${targetEst.type}
+Address: ${targetEst.address}
+Zone: ${targetEst.zone}
+Risk score: ${targetEst.risk_score}/100
+Risk category: ${targetEst.risk_category}
+Last inspection: ${targetEst.last_inspection_date || 'Not recorded'}
+
+INSPECTION HISTORY:
+${JSON.stringify(inspections, null, 2)}
+
+UNRESOLVED VIOLATIONS:
+${JSON.stringify(activeViolations, null, 2)}
 `;
     }
 
-    // 3. Attempt live call to Gemini API
-    if (genAI) {
+    const fallbackReply = globalQuestion
+      ? createMunicipalFallback(allEstablishments)
+      : createFallbackReply(targetEst, inspections, violations);
+
+    if (
+      GEMINI_API_KEY &&
+      GEMINI_API_KEY !== 'your_gemini_api_key_here'
+    ) {
       try {
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        const systemPrompt = `
-You are SafePlate Copilot, an expert AI assistant for municipal food safety officers and establishment managers.
-Analyze the user's question using ONLY the provided verified database context below.
-Be concise, professional, and data-backed. Never invent citations or violation facts.
+        const prompt = `
+You are SafePlate AI, a professional assistant for food-safety inspectors.
 
-VERIFIED DATABASE CONTEXT:
-${contextData}
+Answer the user's question using ONLY the verified SafePlate database context below.
+Never invent violations, dates, inspections, legislation, citations, or facility records.
+If the database does not contain an answer, clearly state that.
+Use short, clear paragraphs and bullet points where helpful.
 
-USER QUERY:
+VERIFIED SAFEPLATE DATABASE CONTEXT:
+${groundedContext}
+
+USER QUESTION:
 ${query}
 `;
-        const result = await model.generateContent(systemPrompt);
-        const aiResponse = result.response.text();
+
+        const geminiResponse = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [{ text: prompt }]
+                }
+              ],
+              generationConfig: {
+                temperature: 0.3,
+                maxOutputTokens: 800
+              }
+            })
+          }
+        );
+
+        const geminiData = await geminiResponse.json();
+
+        if (!geminiResponse.ok) {
+          throw new Error(
+            geminiData.error?.message ||
+              `Gemini request failed with status ${geminiResponse.status}`
+          );
+        }
+
+        const aiReply = (geminiData.candidates?.[0]?.content?.parts || [])
+          .map((part) => part.text || '')
+          .join('')
+          .trim();
+
+        if (!aiReply) {
+          throw new Error('Gemini returned an empty response.');
+        }
 
         return res.json({
           success: true,
-          source: 'gemini-1.5-flash',
-          reply: aiResponse
+          source: GEMINI_MODEL,
+          reply: aiReply,
+          response: aiReply
         });
       } catch (geminiError) {
-        console.warn('Gemini API call failed, using dynamic database fallback:', geminiError.message);
+        console.error('Gemini API error:', geminiError.message);
       }
-    }
-
-    // 4. Grounded Dynamic Fallback (Accurate to the queried establishment)
-    let fallbackReply = '';
-    if (targetEst) {
-      const activeViolations = violations.filter(v => v.corrective_action_status !== 'Resolved' && v.corrective_action_status !== 'Closed');
-      const criticalCount = activeViolations.filter(v => v.severity === 'Critical').length;
-
-      fallbackReply = `**${targetEst.name}** is currently designated as **${targetEst.risk_category}** with a compliance risk score of **${targetEst.risk_score}/100**.\n\n` +
-        `- **Location & Zone:** ${targetEst.address} (${targetEst.zone})\n` +
-        `- **Audit Record:** ${inspections.length} inspection(s) logged. Last audit: ${targetEst.last_inspection_date || 'N/A'}.\n` +
-        `- **Active Violations:** ${activeViolations.length} unresolved issue(s) (${criticalCount} Critical).\n\n` +
-        (criticalCount > 0
-          ? `Priority enforcement recommended due to open critical infractions: ${activeViolations.filter(v => v.severity === 'Critical').map(v => v.category).join(', ')}.`
-          : `Facility maintains standard compliance standing with no immediate critical health hazards.`);
-    } else {
-      fallbackReply = `SafePlate Municipal Intelligence is currently monitoring food safety compliance across all municipal zones. For a specific facility analysis, please select an establishment or mention its name.`;
     }
 
     return res.json({
       success: true,
-      source: 'grounded-database-engine',
-      reply: fallbackReply
+      source: 'safeplate-database-fallback',
+      reply: fallbackReply,
+      response: fallbackReply
     });
-
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    console.error('SafePlate AI error:', error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to generate an AI response.'
+    });
   }
 });
 
-// POST /api/genai/explain-risk - Direct Risk Reasoning
+// POST /api/genai/explain-risk
 router.post('/explain-risk', async (req, res) => {
   try {
     const { establishmentId } = req.body;
+
     if (!establishmentId) {
-      return res.status(400).json({ success: false, message: 'establishmentId is required' });
+      return res.status(400).json({
+        success: false,
+        message: 'establishmentId is required'
+      });
     }
 
-    const est = await db.getEstablishmentById(establishmentId);
-    if (!est) {
-      return res.status(404).json({ success: false, message: 'Establishment not found' });
+    const establishment = await db.getEstablishmentById(establishmentId);
+
+    if (!establishment) {
+      return res.status(404).json({
+        success: false,
+        message: 'Establishment not found'
+      });
     }
 
-    const violations = await db.getViolations({ establishment_id: establishmentId });
-    const active = violations.filter(v => v.corrective_action_status !== 'Resolved' && v.corrective_action_status !== 'Closed');
+    const violations = await db.getViolations({
+      establishment_id: establishmentId
+    });
 
-    res.json({
+    const activeViolations = violations.filter(
+      (violation) =>
+        violation.corrective_action_status !== 'Resolved' &&
+        violation.corrective_action_status !== 'Closed'
+    );
+
+    return res.json({
       success: true,
-      establishment: est.name,
-      risk_score: est.risk_score,
-      risk_category: est.risk_category,
-      unresolved_violations_count: active.length,
-      explanation: `Calculated from base score (15) plus ${active.length} active violations across critical and major hazard categories.`
+      establishment: establishment.name,
+      risk_score: establishment.risk_score,
+      risk_category: establishment.risk_category,
+      unresolved_violations_count: activeViolations.length,
+      explanation:
+        `Risk score is ${establishment.risk_score}/100 with ` +
+        `${activeViolations.length} unresolved violation(s).`
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
 });
 
-// POST /api/genai/detect-violation-image (AI Vision Demonstration Simulation)
+// POST /api/genai/detect-violation-image
 router.post('/detect-violation-image', async (req, res) => {
   try {
-    const { profile = 'cooler' } = req.body;
+    // The UI sends `scenario`; support `profile` as well for backwards compatibility.
+    const profile = req.body.scenario || req.body.profile || 'cooler';
 
-    const PRESETS = {
+    const presets = {
       cooler: {
-        category: "Temperature",
-        severity: "Critical",
-        description: "Refrigeration display unit registering 53.4°F ambient air temp; unsafe storage threshold exceeded.",
-        recommendedAction: "Immediately service evaporator coil and relocate perishable items to walk-in cooler."
+        category: 'Temperature',
+        severity: 'Critical',
+        description:
+          'Refrigeration unit registering 53.4°F ambient temperature; unsafe storage threshold exceeded.',
+        suggested_action:
+          'Immediately service the unit and move perishable food to safe cold storage.',
+        image_url: 'https://images.unsplash.com/photo-1584992236310-6edddc08acff?w=600'
       },
       pantry: {
-        category: "Pest",
-        severity: "Major",
-        description: "Dry storage packaging displays evidence of pest intrusion and improper ground clearance.",
-        recommendedAction: "Sanitize shelving, install perimeter pest traps, and elevate containers 6 inches above floor."
+        category: 'Pest',
+        severity: 'Major',
+        description:
+          'Dry storage packaging shows evidence of pest intrusion and improper food storage clearance.',
+        suggested_action:
+          'Sanitize shelves, install pest controls, and elevate food containers at least 6 inches above the floor.',
+        image_url: 'https://images.unsplash.com/photo-1584634731339-252c581abfc5?w=600'
       },
       prep: {
-        category: "Cross-Contamination",
-        severity: "Critical",
-        description: "Raw poultry preparation observed on board designated for ready-to-eat vegetables.",
-        recommendedAction: "Sanitize station immediately and conduct staff re-training on color-coded board protocols."
+        category: 'Cross-Contamination',
+        severity: 'Critical',
+        description:
+          'Raw poultry preparation observed on a board designated for ready-to-eat vegetables.',
+        suggested_action:
+          'Sanitize the station immediately and retrain staff on food-separation procedures.',
+        image_url: 'https://images.unsplash.com/photo-1556911220-e15b29be8c8f?w=600'
       },
       sink: {
-        category: "Sanitation",
-        severity: "Major",
-        description: "Handwashing station lacks required paper towel dispenser and soap cartridge.",
-        recommendedAction: "Restock handwashing supplies immediately prior to next food preparation shift."
+        category: 'Sanitation',
+        severity: 'Major',
+        description:
+          'Handwashing station lacks required soap and paper towels.',
+        suggested_action:
+          'Restock handwashing supplies before food preparation resumes.',
+        image_url: 'https://images.unsplash.com/photo-1584634731339-252c581abfc5?w=600'
       }
     };
 
-    const detected = PRESETS[profile] || PRESETS.cooler;
+    const detection = {
+      ...(presets[profile] || presets.cooler),
+      confidence: 0.96,
+      model: 'SafePlate CV Demo'
+    };
 
-    res.json({
+    return res.json({
       success: true,
-      data: {
-        ...detected,
-        confidence: 0.96,
-        model: "SafePlate-CV-FoodSafety-v2 (Demo Pipeline)"
-      }
+      detection,
+      // Kept for clients built against the earlier response shape.
+      data: detection
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
 });
 

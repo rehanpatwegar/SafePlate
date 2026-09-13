@@ -25,8 +25,14 @@ async function getEstablishments(filters = {}) {
     .select('*')
     .order('risk_score', { ascending: false });
 
-  if (filters.zone) query = query.eq('zone', filters.zone);
-  if (filters.riskCategory) query = query.eq('risk_category', filters.riskCategory);
+  if (filters.zone && filters.zone !== 'All') {
+    query = query.eq('zone', filters.zone);
+  }
+
+  if (filters.riskCategory && filters.riskCategory !== 'All') {
+    query = query.eq('risk_category', filters.riskCategory.toUpperCase());
+  }
+
   if (filters.search) query = query.ilike('name', `%${filters.search}%`);
 
   const { data, error } = await query;
