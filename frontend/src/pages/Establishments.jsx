@@ -40,16 +40,29 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
   const fetchEstablishments = async () => {
     try {
       setLoading(true);
-      const res = await api.getEstablishments({
-        search: search || undefined,
-        zone: zoneFilter,
-        riskCategory: riskFilter
-      });
-      if (res.success) {
-        setEstablishments(res.data);
+      const params = {};
+      
+      // Strict filter sanitization: Don't send filter if it is 'All' or empty
+      if (search && search.trim() !== '') {
+        params.search = search.trim();
       }
+      if (zoneFilter && zoneFilter !== 'All') {
+        params.zone = zoneFilter;
+      }
+      if (riskFilter && riskFilter !== 'All') {
+        params.riskCategory = riskFilter;
+      }
+
+      console.log('Fetching establishments with params:', params);
+      const res = await api.getEstablishments(params);
+      console.log('Establishments API Response:', res);
+      
+      // Extract array safely from both possible response structures
+      const list = res?.data || (Array.isArray(res) ? res : []);
+      setEstablishments(Array.isArray(list) ? list : []);
     } catch (err) {
       console.error('Failed to load establishments:', err);
+      setEstablishments([]);
     } finally {
       setLoading(false);
     }
@@ -65,10 +78,11 @@ export default function Establishments({ initialSelectedId, onOpenInspectionModa
       setProfileLoading(true);
       setAiAnalysis(null);
       setRecalculateMessage(null);
-      const res = await api.getEstablishmentById(id);
-      if (res.success) {
-        setProfileData(res.data);
-        setSelectedEstablishment(res.data);
+      const res = await axios.get(`http://localhost:5000/api/establishments/${id}`);
+      const profile = res.data?.data || res.data;
+      if (profile) {
+        setProfileData(profile);
+        setSelectedEstablishment(profile);
       }
     } catch (err) {
       console.error('Failed to load establishment profile:', err);
