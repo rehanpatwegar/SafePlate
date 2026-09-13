@@ -1,85 +1,114 @@
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
 
-// Mock User Database representing the 4 primary personas
-const ROLES = {
-  inspector: {
-    id: "usr_inspector_01",
-    name: "Marcus Brody",
-    role: "Food-Safety Inspector",
-    badgeNumber: "FSI-9042",
-    agency: "Metro Dept of Public Health",
-    avatar: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150",
-    permissions: ["view_all", "create_inspection", "log_violation", "re_inspect", "trigger_recalculation", "ai_assistant"]
+// Secret key .env se aayegi, ya default dev key use hogi
+const JWT_SECRET = process.env.JWT_SECRET || 'safeplate_super_secret_buildathon_2026';
+
+// Realistic pre-configured users for testing/demo
+const DEMO_USERS = [
+  {
+    id: "usr_admin_1",
+    name: "Dr. Sarah Rao",
+    email: "admin@safeplate.gov",
+    password: "password123",
+    role: "Admin",
+    title: "Chief Public Health Administrator",
+    department: "Municipal Food Safety Authority"
   },
-  manager: {
-    id: "usr_manager_01",
-    name: "Dr. Evelyn Reed",
-    role: "Inspection Manager",
-    badgeNumber: "MGR-1020",
-    agency: "Public Health Safety Commission",
-    avatar: "https://images.unsplash.com/photo-1580489944761-15a19d654956?w=150",
-    permissions: ["view_all", "analytics", "assign_inspectors", "audit_reviews", "ai_assistant", "admin_controls"]
+  {
+    id: "usr_insp_1",
+    name: "Officer Marcus Brody",
+    email: "brody@safeplate.gov",
+    password: "password123",
+    role: "Inspector",
+    title: "Senior Food Safety Inspector",
+    badgeNumber: "FSI-4091"
   },
-  owner: {
-    id: "usr_owner_01",
+  {
+    id: "usr_mgr_1",
     name: "Rajesh Patel",
-    role: "Establishment Owner",
-    establishmentId: 1,
-    establishmentName: "Central Spice Restaurant",
-    agency: "Food Safety Licensee",
-    avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=150",
-    permissions: ["view_own", "submit_corrective_action", "request_reinspection", "ai_assistant"]
-  },
-  admin: {
-    id: "usr_admin_01",
-    name: "System Administrator",
-    role: "Administrator",
-    badgeNumber: "ADM-0001",
-    agency: "SafePlate Platform Administration",
-    avatar: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=150",
-    permissions: ["all", "system_settings", "ml_model_sync", "user_management"]
+    email: "manager@centralspice.com",
+    password: "password123",
+    role: "Establishment Manager",
+    title: "Proprietor / Operating Head",
+    establishmentId: 1
   }
-};
+];
 
-let currentActiveRole = "inspector";
+// POST /api/auth/login
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password, role } = req.body;
 
-// GET current session user
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Email is required" });
+    }
+
+    // Match with demo user or accept role credentials
+    let user = DEMO_USERS.find(u => u.email.toLowerCase() === email.toLowerCase());
+
+    // If specific email not found, create a session user with selected role
+    if (!user) {
+      const selectedRole = role || "Inspector";
+      user = {
+        id: `usr_${Date.now()}`,
+        name: email.split('@')[0],
+        email: email,
+        role: selectedRole,
+        title: `${selectedRole} Staff`
+      };
+    }
+
+    // Sign a real JWT valid for 24 hours
+    const token = jwt.sign(
+      {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        establishmentId: user.establishmentId || null
+      },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      success: true,
+      message: `Authenticated successfully as ${user.role}`,
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        title: user.title,
+        badgeNumber: user.badgeNumber || null,
+        establishmentId: user.establishmentId || null
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /api/auth/me (Verify active token)
 router.get('/me', (req, res) => {
-  const user = ROLES[currentActiveRole] || ROLES.inspector;
-  res.json({
-    success: true,
-    user,
-    activeRoleKey: currentActiveRole,
-    availableRoles: Object.keys(ROLES).map(k => ({
-      key: k,
-      name: ROLES[k].name,
-      role: ROLES[k].role,
-      agency: ROLES[k].agency
-    }))
-  });
-});
-
-// Switch role (Mock auth)
-router.post('/switch-role', (req, res) => {
-  const { roleKey } = req.body;
-  if (!ROLES[roleKey]) {
-    return res.status(400).json({ success: false, message: `Invalid role: ${roleKey}` });
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: "No active token provided" });
   }
-  currentActiveRole = roleKey;
-  res.json({
-    success: true,
-    message: `Switched active profile to ${ROLES[roleKey].role}`,
-    user: ROLES[currentActiveRole]
-  });
-});
 
-// GET all roles
-router.get('/roles', (req, res) => {
-  res.json({
-    success: true,
-    roles: ROLES
-  });
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    res.json({
+      success: true,
+      user: decoded
+    });
+  } catch (err) {
+    res.status(401).json({ success: false, message: "Invalid or expired session token" });
+  }
 });
 
 module.exports = router;

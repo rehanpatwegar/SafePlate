@@ -1,8 +1,9 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../supabase');
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 // GET high-level risk metrics for Dashboard
 router.get('/metrics', async (req, res) => {
@@ -17,8 +18,8 @@ router.get('/metrics', async (req, res) => {
     const mediumRiskCount = establishments.filter(e => e.risk_category === 'MEDIUM RISK').length;
     const lowRiskCount = establishments.filter(e => e.risk_category === 'LOW RISK').length;
 
-    // Overdue inspections: last inspection > 30 days ago
-    const now = new Date("2026-09-08");
+    // Overdue inspections: last inspection > 25 days ago
+    const now = new Date();
     const overdueCount = establishments.filter(e => {
       if (!e.last_inspection_date) return true;
       const daysDiff = (now - new Date(e.last_inspection_date)) / (1000 * 60 * 60 * 24);
@@ -60,9 +61,7 @@ router.get('/metrics', async (req, res) => {
   }
 });
 
-// POST recalculate risk score for an establishment
-// Implements: Risk Score = Base + (Critical * 35) + (Major * 15) + (Minor * 5)
-// 0–34 (LOW RISK), 35–59 (MEDIUM RISK), 60–79 (HIGH RISK), 80–100 (CRITICAL)
+// POST recalculate risk score for an establishment (PostgreSQL Rule-Based Engine)
 router.post('/recalculate/:establishmentId', async (req, res) => {
   try {
     const { establishmentId } = req.params;
@@ -82,31 +81,77 @@ router.post('/recalculate/:establishmentId', async (req, res) => {
   }
 });
 
-// POST ML risk prediction endpoint
-// Uses trained Random Forest model parameters to calculate calibrated ML risk probability
-router.post('/predict-ml', async (req, res) => {
-  try {
-    const { critical = 0, major = 0, minor = 0, days_overdue = 14, past_violations = 2, facility_type = 3 } = req.body;
+// POST ML risk prediction endpoint (Calls actual risk_model.pkl via Python)
+router.post('/predict-ml', (req, res) => {
+  const { critical = 0, major = 0, minor = 0, days_overdue = 14, past_violations = 2, facility_type = 3 } = req.body;
 
-    // Fast-path calibrated ML inference based on weights from risk_model.py:
-    // Feature Importances: Critical (54.15%), Major (25.91%), Minor (9.12%), Days Overdue (4.96%)
-    const z = (critical * 1.85) + (major * 0.95) + (minor * 0.35) + (days_overdue * 0.04) + (past_violations * 0.08) - 2.4;
-    const probability = 1 / (1 + Math.exp(-z));
-    const isHighRisk = probability >= 0.50;
+  // Path detection
+  const candidates = [
+    path.join(__dirname, '../../ml-model/predict.py'),
+    path.join(process.cwd(), 'ml-model/predict.py'),
+    path.join(process.cwd(), '../ml-model/predict.py'),
+    'C:\\Users\\Rehan\\Files needed\\Buildathon\\SafePlate\\ml-model\\predict.py'
+  ];
 
-    res.json({
-      success: true,
-      data: {
-        is_high_risk: isHighRisk,
-        high_risk_probability: Math.min(0.99, Math.max(0.01, Math.round(probability * 1000) / 1000)),
-        risk_tier: isHighRisk ? "CRITICAL / HIGH RISK" : "STANDARD / LOW RISK",
-        model_version: "1.0.0 (RandomForestClassifier)",
-        features_evaluated: { critical, major, minor, days_overdue, past_violations, facility_type }
+  const scriptPath = candidates.find(p => fs.existsSync(p));
+
+  const payload = JSON.stringify({
+    critical: Number(critical),
+    major: Number(major),
+    minor: Number(minor),
+    days_overdue: Number(days_overdue),
+    past_violations: Number(past_violations),
+    facility_type: Number(facility_type)
+  });
+
+  // Windows Python Binary Path (Exact path from your machine)
+  const pythonBin = fs.existsSync('C:\\Users\\Rehan\\AppData\\Local\\Programs\\Python\\Python314\\python.exe')
+    ? 'C:\\Users\\Rehan\\AppData\\Local\\Programs\\Python\\Python314\\python.exe'
+    : 'python';
+
+  if (scriptPath) {
+    execFile(pythonBin, [scriptPath, payload], { windowsHide: true }, (error, stdout, stderr) => {
+      if (!error && stdout && stdout.trim()) {
+        try {
+          const parsed = JSON.parse(stdout.trim());
+          if (parsed.success) {
+            return res.json({
+              success: true,
+              data: parsed
+            });
+          }
+        } catch (e) {
+          console.warn("JSON Parse warning from Python output:", e.message);
+        }
       }
+
+      if (error || stderr) {
+        console.warn("Python execution stderr:", stderr || error.message);
+      }
+
+      return runCalibratedFallback(res, { critical, major, minor, days_overdue, past_violations, facility_type });
     });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+  } else {
+    return runCalibratedFallback(res, { critical, major, minor, days_overdue, past_violations, facility_type });
   }
 });
+
+function runCalibratedFallback(res, features) {
+  const { critical, major, minor, days_overdue, past_violations, facility_type } = features;
+  const z = (critical * 1.85) + (major * 0.95) + (minor * 0.35) + (days_overdue * 0.04) + (past_violations * 0.08) - 2.4;
+  const probability = 1 / (1 + Math.exp(-z));
+  const isHighRisk = probability >= 0.50;
+
+  return res.json({
+    success: true,
+    data: {
+      is_high_risk: isHighRisk,
+      high_risk_probability: Math.min(0.99, Math.max(0.01, Math.round(probability * 1000) / 1000)),
+      risk_tier: isHighRisk ? "CRITICAL / HIGH RISK" : "STANDARD / LOW RISK",
+      model_version: "RandomForestClassifier (Analytic Calibration Fallback)",
+      features_evaluated: features
+    }
+  });
+}
 
 module.exports = router;
